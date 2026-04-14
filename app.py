@@ -5,8 +5,15 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from sklearn.ensemble import IsolationForest
-from sklearn.feature_selection import mutual_info_classif, VarianceThreshold
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.feature_selection import VarianceThreshold, mutual_info_classif
+from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.tree import DecisionTreeClassifier
 
 from utils import (
     TARGET_LABELS,
@@ -19,7 +26,6 @@ from utils import (
     plot_numeric_correlation,
     plot_workclass_distribution,
     prepare_dataframe,
-    train_and_evaluate_models,
 )
 
 st.set_page_config(page_title="Income Classification Dashboard", layout="wide")
@@ -75,6 +81,10 @@ st.markdown("""
     font-size: 17px;
     font-weight: 500;
 }
+.small-note {
+    color: #94a3b8;
+    font-size: 0.92rem;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -88,18 +98,14 @@ def get_raw_data():
 
 
 @st.cache_data
-def get_prepared_data():
+def get_base_prepared_data():
     return prepare_dataframe(get_raw_data())
-
-
-@st.cache_resource
-def get_training_outputs():
-    return train_and_evaluate_models(get_prepared_data())
 
 
 def get_missing_summary(df: pd.DataFrame) -> pd.DataFrame:
     missing_count = df.isna().sum()
     missing_percent = (df.isna().mean() * 100).round(2)
+
     summary = pd.DataFrame(
         {
             "Column": df.columns,
@@ -107,9 +113,11 @@ def get_missing_summary(df: pd.DataFrame) -> pd.DataFrame:
             "Missing %": missing_percent.values,
         }
     )
+
     summary = summary[summary["Missing Count"] > 0].sort_values(
         by="Missing %", ascending=False
     ).reset_index(drop=True)
+
     return summary
 
 
@@ -122,6 +130,7 @@ def drop_rows_by_columns(df: pd.DataFrame, selected_columns):
 
 def apply_manual_imputation(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     categorical_cols = df.select_dtypes(exclude=[np.number]).columns
 
@@ -315,22 +324,141 @@ def get_feature_selection_summary(df: pd.DataFrame):
     return variance_df, corr_df, mi_df
 
 
-@st.cache_data
-def get_cv_scores():
-    prepared = get_prepared_data()
-    models, _, _ = get_training_outputs()
+def build_training_dataset_from_working_df(df: pd.DataFrame):
+    temp = df.copy()
+
+    if "capital_gain" in temp.columns and "capital_loss" in temp.columns and "capital_balance" not in temp.columns:
+        temp["capital_balance"] = temp["capital_gain"].fillna(0) - temp["capital_loss"].fillna(0)
+
+    if "capital_gain" in temp.columns and "has_capital_gain" not in temp.columns:
+        temp["has_capital_gain"] = (temp["capital_gain"].fillna(0) > 0).astype(int)
+
+    if "capital_loss" in temp.columns and "has_capital_loss" not in temp.columns:
+        temp["has_capital_loss"] = (temp["capital_loss"].fillna(0) > 0).astype(int)
+
+    if "hours_per_week" in temp.columns and "is_long_workweek" not in temp.columns:
+        temp["is_long_workweek"] = (temp["hours_per_week"].fillna(0) > 40).astype(int)
+
+    temp = temp.drop(columns=["education"], errors="ignore")
+
+    if "income" in temp.columns and temp["income"].dtype == "object":
+        temp["income"] = temp["income"].map({"<=50K": 0, ">50K": 1})
+
+    temp = temp.dropna(subset=["income"]).reset_index(drop=True)
+    temp["income"] = temp["income"].astype(int)
+
+    X = temp.drop(columns=["income"])
+    y = temp["income"]
+
+    numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
+    categorical_features = [c for c in X.columns if c not in numeric_features]
+
+    return temp, X, y, numeric_features, categorical_features
+
+
+def train_models_on_custom_preprocessing(df: pd.DataFrame):
+    processed_df, X, y, numeric_features, categorical_features = build_training_dataset_from_working_df(df)
+
+    custom_models = {
+        "Logistic Regression": LogisticRegression(max_iter=2000),
+        "KNN": KNeighborsClassifier(n_neighbors=7),
+        "Decision Tree": DecisionTreeClassifier(max_depth=12, random_state=42),
+    }
+
+    numeric_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]
+    )
+    categorical_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore")),
+        ]
+    )
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numeric_pipeline, numeric_features),
+            ("cat", categorical_pipeline, categorical_features),
+        ]
+    )
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    models = {}
+    rows = []
+    split_data = (X_train, X_test, y_train, y_test)
+
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+    for name, estimator in custom_models.items():
+        pipeline = Pipeline(
+            steps=[
+                ("preprocessor", preprocessor),
+                ("model", estimator),
+            ]
+        )
+        pipeline.fit(X_train, y_train)
+        y_pred = pipeline.predict(X_test)
+
+        rows.append(
+            {
+                "Model": name,
+                "Accuracy": accuracy_score(y_test, y_pred),
+                "Precision": precision_score(y_test, y_pred, zero_division=0),
+                "Recall": recall_score(y_test, y_pred, zero_division=0),
+                "F1 Score": f1_score(y_test, y_pred, zero_division=0),
+            }
+        )
+        models[name] = pipeline
+
+    results = pd.DataFrame(rows).sort_values(by="F1 Score", ascending=False).reset_index(drop=True)
+    return processed_df, models, results, split_data
+
+
+def get_cv_scores_from_working_df(df: pd.DataFrame):
+    _, X, y, numeric_features, categorical_features = build_training_dataset_from_working_df(df)
+
+    numeric_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]
+    )
+    categorical_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore")),
+        ]
+    )
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numeric_pipeline, numeric_features),
+            ("cat", categorical_pipeline, categorical_features),
+        ]
+    )
+
+    model_map = {
+        "Logistic Regression": LogisticRegression(max_iter=2000),
+        "KNN": KNeighborsClassifier(n_neighbors=7),
+        "Decision Tree": DecisionTreeClassifier(max_depth=12, random_state=42),
+    }
 
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     rows = []
-    for model_name, pipeline in models.items():
-        scores = cross_val_score(
-            pipeline,
-            prepared.X,
-            prepared.y,
-            cv=cv,
-            scoring="f1",
-            n_jobs=None,
+
+    for model_name, estimator in model_map.items():
+        pipeline = Pipeline(
+            steps=[
+                ("preprocessor", preprocessor),
+                ("model", estimator),
+            ]
         )
+        scores = cross_val_score(pipeline, X, y, cv=cv, scoring="f1")
         rows.append(
             {
                 "Model": model_name,
@@ -338,7 +466,13 @@ def get_cv_scores():
                 "Std CV F1": round(float(scores.std()), 4),
             }
         )
+
     return pd.DataFrame(rows).sort_values("Mean CV F1", ascending=False).reset_index(drop=True)
+
+
+def train_default_models():
+    prepared = get_base_prepared_data()
+    return train_models_on_custom_preprocessing(prepared.df)
 
 
 st.title("Income Classification Dashboard")
@@ -358,12 +492,25 @@ page = st.sidebar.radio(
 )
 
 raw_df = get_raw_data()
-prepared = get_prepared_data()
-models, results, split_data = get_training_outputs()
+prepared = get_base_prepared_data()
+
+if "working_df" not in st.session_state:
+    st.session_state.working_df = raw_df.copy()
+
+if "custom_models" not in st.session_state or "custom_results" not in st.session_state:
+    default_processed_df, default_models, default_results, default_split = train_default_models()
+    st.session_state.custom_models = default_models
+    st.session_state.custom_results = default_results
+    st.session_state.custom_split = default_split
+    st.session_state.training_source = "Default backend preprocessing"
+    st.session_state.training_processed_shape = default_processed_df.shape
+
+models = st.session_state.custom_models
+results = st.session_state.custom_results
+split_data = st.session_state.custom_split
 _, X_test, _, y_test = split_data
 best_model_name = results.iloc[0]["Model"]
 best_model = models[best_model_name]
-cm, report = get_confusion_and_report(best_model, X_test, y_test)
 
 if page == "Project Overview":
     st.markdown("## Problem Statement")
@@ -373,7 +520,6 @@ if page == "Project Overview":
 
     st.markdown("## Project Snapshot")
     c1, c2, c3 = st.columns(3)
-
     with c1:
         st.markdown("""
         <div class="metric-card">
@@ -381,7 +527,6 @@ if page == "Project Overview":
             <div class="metric-value">Adult Income</div>
         </div>
         """, unsafe_allow_html=True)
-
     with c2:
         st.markdown("""
         <div class="metric-card">
@@ -389,7 +534,6 @@ if page == "Project Overview":
             <div class="metric-value">3</div>
         </div>
         """, unsafe_allow_html=True)
-
     with c3:
         st.markdown("""
         <div class="metric-card">
@@ -399,7 +543,6 @@ if page == "Project Overview":
         """, unsafe_allow_html=True)
 
     st.markdown("## Workflow Overview")
-
     col1, col2 = st.columns(2)
 
     with col1:
@@ -443,9 +586,9 @@ if page == "Project Overview":
         <div class="workflow-card">
             <div class="workflow-title">4. Prediction System</div>
             <ul class="workflow-list">
+                <li>Train on the current preprocessed dataset</li>
                 <li>Evaluate models using confusion matrix</li>
-                <li>Predict single record income</li>
-                <li>Predict batch records</li>
+                <li>Predict single and batch records</li>
                 <li>Display results in dashboard</li>
             </ul>
         </div>
@@ -454,7 +597,7 @@ if page == "Project Overview":
     st.markdown("## End-to-End Pipeline")
     st.markdown("""
     <div class="pipeline-box">
-        Dataset Loading → Cleaning & Preprocessing → Feature Engineering → Model Training → Evaluation → Prediction Dashboard
+        Dataset Loading → User Preprocessing → Feature Engineering → Model Training → Evaluation → Prediction Dashboard
     </div>
     """, unsafe_allow_html=True)
 
@@ -482,7 +625,7 @@ elif page == "EDA":
 
     st.markdown("---")
     st.subheader("Feature Selection Summary")
-    variance_df, corr_df, mi_df = get_feature_selection_summary(raw_df)
+    variance_df, corr_df, mi_df = get_feature_selection_summary(st.session_state.working_df)
 
     if variance_df.empty:
         st.warning("Feature selection summary could not be generated.")
@@ -498,13 +641,8 @@ elif page == "EDA":
 elif page == "Preprocessing":
     st.subheader("Interactive Data Preprocessing")
     st.caption(
-        "Explore missing values, delete rows selectively, apply imputation, detect outliers, and track dataset shape after each step."
+        "Apply preprocessing to the dataset and then retrain models on the same processed dataset."
     )
-
-
-
-    if "working_df" not in st.session_state:
-        st.session_state.working_df = raw_df.copy()
 
     working_df = st.session_state.working_df.copy()
 
@@ -515,7 +653,6 @@ elif page == "Preprocessing":
     c3.metric("Missing Cells", int(working_df.isna().sum().sum()))
 
     st.markdown("---")
-
     st.markdown("### 1. Missing Value Analysis")
     missing_summary = get_missing_summary(working_df)
 
@@ -525,11 +662,9 @@ elif page == "Preprocessing":
         st.dataframe(missing_summary, use_container_width=True)
 
     st.markdown("---")
-
     st.markdown("### 2. Remove Rows with Missing Values")
     st.write("Choose the columns for which rows containing missing values should be removed.")
     removable_columns = missing_summary["Column"].tolist() if not missing_summary.empty else []
-
     selected_drop_cols = st.multiselect("Select columns for row deletion", removable_columns)
 
     if st.button("Apply Row Deletion"):
@@ -544,37 +679,25 @@ elif page == "Preprocessing":
             st.warning("Please select at least one column.")
 
     st.markdown("---")
-
     st.markdown("### 3. Missing Value Imputation")
-    st.write(
-        "Numeric columns are filled using median. Categorical columns are filled using mode. This step can be used with or without row deletion."
-    )
+    st.write("Numeric columns are filled using median. Categorical columns are filled using mode.")
 
     if st.button("Apply Imputation"):
         before_missing = int(working_df.isna().sum().sum())
         before_shape = working_df.shape
-
         working_df = apply_manual_imputation(working_df)
         st.session_state.working_df = working_df
-
         after_missing = int(working_df.isna().sum().sum())
         st.success(
             f"Imputation completed. Missing cells changed from {before_missing} to {after_missing}. Current shape: {before_shape} to {working_df.shape}."
         )
 
     st.markdown("---")
-
     st.markdown("### 4. Outlier Detection")
-    method = st.selectbox(
-        "Choose outlier detection method",
-        ["IQR Summary", "Isolation Forest Summary"],
-    )
+    method = st.selectbox("Choose outlier detection method", ["IQR Summary", "Isolation Forest Summary"])
 
     if method == "IQR Summary":
-        st.warning(
-            "IQR-based outlier detection is applied across suitable numeric columns. "
-            "Use capping to preserve dataset size."
-        )
+        st.warning("Use capping to preserve dataset size.")
         outlier_summary_df, _, total_rows_with_any_outlier = get_outlier_summary(working_df)
 
         if outlier_summary_df.empty:
@@ -582,7 +705,6 @@ elif page == "Preprocessing":
         else:
             st.dataframe(outlier_summary_df, use_container_width=True)
             st.info(f"Rows having at least one detected outlier: {total_rows_with_any_outlier}")
-            st.caption("Recommended: Use capping to preserve dataset size.")
 
             b1, b2 = st.columns(2)
             with b1:
@@ -593,7 +715,6 @@ elif page == "Preprocessing":
                     st.success(
                         f"Outlier removal completed. Removed rows: {removed_rows}. Shape changed from {before_shape} to {working_df.shape}."
                     )
-
             with b2:
                 if st.button("Cap All Detected Outliers"):
                     before_shape = working_df.shape
@@ -627,7 +748,6 @@ elif page == "Preprocessing":
     c1.metric("Rows", st.session_state.working_df.shape[0])
     c2.metric("Columns", st.session_state.working_df.shape[1])
     c3.metric("Missing Cells", int(st.session_state.working_df.isna().sum().sum()))
-
     st.dataframe(st.session_state.working_df.head(15), use_container_width=True)
 
     st.markdown("### 6. Feature Type Summary")
@@ -643,6 +763,29 @@ elif page == "Preprocessing":
         mime="text/csv",
     )
 
+    st.markdown("---")
+    st.markdown("### 7. Retrain Models on Current Preprocessed Dataset")
+    st.markdown(
+        "<div class='small-note'>This button trains the models using the dataset after your current preprocessing steps, not the default raw-data preprocessing.</div>",
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Train Models on Current Preprocessed Data"):
+        try:
+            processed_df, trained_models, trained_results, trained_split = train_models_on_custom_preprocessing(
+                st.session_state.working_df
+            )
+            st.session_state.custom_models = trained_models
+            st.session_state.custom_results = trained_results
+            st.session_state.custom_split = trained_split
+            st.session_state.training_source = "User preprocessing from Preprocessing page"
+            st.session_state.training_processed_shape = processed_df.shape
+            st.success(
+                f"Training completed on user-preprocessed dataset. Processed training shape: {processed_df.shape}"
+            )
+        except Exception as e:
+            st.error(f"Training failed on current preprocessed dataset: {e}")
+
     if st.button("Reset to Original Raw Dataset"):
         st.session_state.working_df = raw_df.copy()
         st.success("Dataset has been reset to original raw data.")
@@ -652,12 +795,24 @@ elif page == "Model Training & Evaluation":
     st.success(f"Current best model based on F1 Score: **{best_model_name}**")
     st.dataframe(results, use_container_width=True)
 
+    st.info(
+        f"Training source: {st.session_state.get('training_source', 'Default backend preprocessing')} | "
+        f"Training processed shape: {st.session_state.get('training_processed_shape', prepared.df.shape)}"
+    )
+
     st.markdown("### 5-Fold Cross Validation Summary")
-    cv_df = get_cv_scores()
-    st.dataframe(cv_df, use_container_width=True)
+    try:
+        if st.session_state.get("training_source") == "User preprocessing from Preprocessing page":
+            cv_df = get_cv_scores_from_working_df(st.session_state.working_df)
+        else:
+            cv_df = get_cv_scores_from_working_df(prepared.df)
+        st.dataframe(cv_df, use_container_width=True)
+    except Exception as e:
+        st.warning(f"Could not compute CV summary: {e}")
 
     model_name = st.selectbox("Select model to inspect", results["Model"].tolist())
     selected_model = models[model_name]
+    _, X_test, _, y_test = st.session_state.custom_split
     cm_selected, report_selected = get_confusion_and_report(selected_model, X_test, y_test)
 
     st.pyplot(plot_confusion_matrix(cm_selected))
