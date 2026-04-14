@@ -501,10 +501,7 @@ elif page == "Preprocessing":
         "Explore missing values, delete rows selectively, apply imputation, detect outliers, and track dataset shape after each step."
     )
 
-    st.info(
-        "Note: This interactive preprocessing page is for dataset analysis and demonstration. "
-        "The current model training still uses the backend preprocessing pipeline defined in utils.py."
-    )
+
 
     if "working_df" not in st.session_state:
         st.session_state.working_df = raw_df.copy()
